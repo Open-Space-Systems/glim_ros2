@@ -47,6 +47,8 @@ private:
 
 private:
   std::atomic_bool kill_switch;
+  std::atomic_bool fatal_estimator_error{false};
+  int corruption_callback, new_frame_callback, corrected_frame_callback, global_callback;
   std::thread thread;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer;
@@ -61,6 +63,7 @@ private:
   std::string odom_frame_id;
   std::string map_frame_id;
   bool publish_imu2lidar;
+  bool publish_odometry_tf;
   double tf_time_offset;
 
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> map_pub;

@@ -55,6 +55,20 @@ ament_auto_add_library(rviz_viewer SHARED
   src/glim_ros/rviz_viewer.cpp
 )
 
+### abs_constraint_module ###
+ament_auto_add_library(revision_module SHARED src/glim_ros/revision_module.cpp)
+target_link_libraries(revision_module glim::glim)
+
+# Fuses an external absolute-position measurement (synthetic_rtk) into GLIM's
+# odometry smoother as a robust GPSFactor on the live pose key. Additive module;
+# GLIM core is untouched.
+ament_auto_add_library(abs_constraint_module SHARED
+  src/glim_ros/abs_constraint_module.cpp
+)
+target_link_libraries(abs_constraint_module
+  glim::glim
+)
+
 ### glim_rosnode ###
 ament_auto_add_executable(glim_rosnode
   src/glim_rosnode.cpp
@@ -100,6 +114,28 @@ if(BUILD_WITH_VIEWER)
     glim::map_editor
     Boost::program_options
   )
+endif()
+
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(test_absolute_association test/test_absolute_association.cpp)
+  target_compile_features(test_absolute_association PRIVATE cxx_std_17)
+  target_include_directories(test_absolute_association PRIVATE include)
+  add_test(NAME test_absolute_association COMMAND test_absolute_association)
+  add_executable(test_trajectory_contract test/test_trajectory_contract.cpp)
+  target_link_libraries(test_trajectory_contract glim::glim)
+  add_test(NAME test_trajectory_contract COMMAND test_trajectory_contract)
+  ament_auto_add_executable(test_revision_module test/test_revision_module.cpp)
+  target_link_libraries(test_revision_module glim::glim)
+  add_test(NAME test_revision_module COMMAND test_revision_module
+    ${CMAKE_CURRENT_SOURCE_DIR}/../glim_slam_launch/config/glim_astrobot)
+  set_tests_properties(test_revision_module PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=179")
+  ament_auto_add_executable(test_rviz_frame_contract test/test_rviz_frame_contract.cpp)
+  target_include_directories(test_rviz_frame_contract PRIVATE include)
+  target_link_libraries(test_rviz_frame_contract rviz_viewer glim::glim)
+  add_test(NAME test_rviz_frame_contract COMMAND test_rviz_frame_contract
+    ${CMAKE_CURRENT_SOURCE_DIR}/../glim_slam_launch/config/glim_astrobot)
+  set_tests_properties(test_rviz_frame_contract PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=179" TIMEOUT 20)
 endif()
 
 ament_auto_package()

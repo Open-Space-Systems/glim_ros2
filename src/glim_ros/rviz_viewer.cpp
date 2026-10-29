@@ -28,6 +28,7 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   odom_frame_id = config.param<std::string>("glim_ros", "odom_frame_id", "odom");
   map_frame_id = config.param<std::string>("glim_ros", "map_frame_id", "map");
   publish_imu2lidar = config.param<bool>("glim_ros", "publish_imu2lidar", true);
+  publish_odometry_tf = config.param<bool>("glim_ros", "publish_odometry_tf", true);
   tf_time_offset = config.param<double>("glim_ros", "tf_time_offset", 1e-6);
 
   last_globalmap_pub_time = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
@@ -53,6 +54,10 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
 RvizViewer::~RvizViewer() {
   kill_switch = true;
   thread.join();
+  OdometryEstimationCallbacks::on_smoother_corruption.remove(corruption_callback);
+  OdometryEstimationCallbacks::on_new_frame.remove(new_frame_callback);
+  OdometryEstimationCallbacks::on_update_new_frame.remove(corrected_frame_callback);
+  GlobalMappingCallbacks::on_update_submaps.remove(global_callback);
 }
 
 std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclcpp::Node& node) {
@@ -103,13 +108,15 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
 }
 
 void RvizViewer::set_callbacks() {
+  corruption_callback = OdometryEstimationCallbacks::on_smoother_corruption.add([this](double) { fatal_estimator_error = true; });
   using std::placeholders::_1;
-  OdometryEstimationCallbacks::on_new_frame.add([this](const EstimationFrame::ConstPtr& new_frame) { odometry_new_frame(new_frame, false); });
-  OdometryEstimationCallbacks::on_update_new_frame.add([this](const EstimationFrame::ConstPtr& new_frame) { odometry_new_frame(new_frame, true); });
-  GlobalMappingCallbacks::on_update_submaps.add(std::bind(&RvizViewer::globalmap_on_update_submaps, this, _1));
+  new_frame_callback = OdometryEstimationCallbacks::on_new_frame.add([this](const EstimationFrame::ConstPtr& new_frame) { odometry_new_frame(new_frame, false); });
+  corrected_frame_callback = OdometryEstimationCallbacks::on_update_new_frame.add([this](const EstimationFrame::ConstPtr& new_frame) { odometry_new_frame(new_frame, true); });
+  global_callback = GlobalMappingCallbacks::on_update_submaps.add(std::bind(&RvizViewer::globalmap_on_update_submaps, this, _1));
 }
 
 void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, bool corrected) {
+  if (fatal_estimator_error) return;
   const Eigen::Isometry3d T_odom_imu = new_frame->T_world_imu;
   const Eigen::Quaterniond quat_odom_imu(T_odom_imu.linear());
   const Eigen::Vector3d v_odom_imu = new_frame->v_world_imu;
@@ -184,7 +191,7 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, 
   const auto tf_stamp = from_sec(new_frame->stamp + tf_time_offset);
   const auto imu_end_stamp = from_sec(imu_end_time);
 
-  const bool publish_tf = !corrected;
+  const bool publish_tf = !corrected && publish_odometry_tf;
   if (publish_tf) {
     // Odom -> Base
     geometry_msgs::msg::TransformStamped trans;
@@ -454,7 +461,9 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, 
     // Publish points aligned to the world frame to avoid some visualization issues in Rviz2
     std::vector<Eigen::Vector4d> transformed(new_frame->frame->size());
     for (int i = 0; i < new_frame->frame->size(); i++) {
-      transformed[i] = new_frame->T_world_sensor() * new_frame->frame->points[i];
+      // Pose messages above use this same snapshot of the global correction.
+      // EstimationFrame's "world" is estimator-local, not loop-corrected map.
+      transformed[i] = T_world_odom * new_frame->T_world_sensor() * new_frame->frame->points[i];
     }
 
     gtsam_points::PointCloud frame;
@@ -471,23 +480,26 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, 
 }
 
 void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& submaps) {
+  if (submaps.empty() || submaps.back()->odom_frames.empty()) return;
   const SubMap::ConstPtr latest_submap = submaps.back();
 
-  const double stamp_endpoint_R = latest_submap->odom_frames.back()->stamp;
   const Eigen::Isometry3d T_world_endpoint_R = latest_submap->T_world_origin * latest_submap->T_origin_endpoint_R;
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex);
-    trajectory->update_anchor(stamp_endpoint_R, T_world_endpoint_R);
+    trajectory->update_anchor(T_world_endpoint_R, latest_submap->odom_frames.back()->T_world_imu);
   }
 
   std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> submap_poses(submaps.size());
+  std::vector<gtsam_points::PointCloud::ConstPtr> submap_frames(submaps.size());
   for (int i = 0; i < submaps.size(); i++) {
     submap_poses[i] = submaps[i]->T_world_origin;
+    submap_frames[i] = submaps[i]->frame;
   }
 
   // Invoke a submap concatenation task in the RvizViewer thread
-  invoke([this, latest_submap, submap_poses] {
-    this->submaps.push_back(latest_submap->frame);
+  invoke([this, submap_frames, submap_poses] {
+    // A graph update is a snapshot, not necessarily a newly inserted submap.
+    this->submaps = submap_frames;
 
     if (!map_pub->get_subscription_count()) {
       return;

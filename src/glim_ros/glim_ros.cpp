@@ -205,13 +205,20 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
 GlimROS::~GlimROS() {
   spdlog::debug("quit");
-  extension_modules.clear();
+  // Callback slots capture extension objects. Drain and join producers before
+  // unloading those objects (also when used as a component, not just rosnode).
+  if (timer) timer->cancel();
+  wait(true);
 
   if (dump_on_unload) {
     std::string dump_path = "/tmp/dump";
-    wait(true);
     save(dump_path);
   }
+  global_mapping.reset();
+  sub_mapping.reset();
+  odometry_estimation.reset();
+  extension_subs.clear();
+  extension_modules.clear();
 }
 
 const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension_subscriptions() {
